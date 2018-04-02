@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"github.com/anacrolix/log"
 )
 
 // ErrNotDeleted is returned by functions that delete jobs to indicate that although the redis commands were successful,
@@ -18,12 +19,12 @@ var ErrNotRetried = fmt.Errorf("nothing retried")
 
 // Client implements all of the functionality of the web UI. It can be used to inspect the status of a running cluster and retry dead jobs.
 type Client struct {
-	namespace string
+	namespace []string
 	pool      *redis.Pool
 }
 
 // NewClient creates a new Client with the specified redis namespace and connection pool.
-func NewClient(namespace string, pool *redis.Pool) *Client {
+func NewClient(namespace []string, pool *redis.Pool) *Client {
 	return &Client{
 		namespace: namespace,
 		pool:      pool,
@@ -42,12 +43,12 @@ type WorkerPoolHeartbeat struct {
 	WorkerIDs    []string `json:"worker_ids"`
 }
 
-// WorkerPoolHeartbeats queries Redis and returns all WorkerPoolHeartbeat's it finds (even for those worker pools which don't have a current heartbeat).
-func (c *Client) WorkerPoolHeartbeats() ([]*WorkerPoolHeartbeat, error) {
+func getHeartbeatsByNamespace(namespace string, c *Client) ([]*WorkerPoolHeartbeat, error) {
+
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	workerPoolsKey := redisKeyWorkerPools(c.namespace)
+	workerPoolsKey := redisKeyWorkerPools(namespace)
 
 	workerPoolIDs, err := redis.Strings(conn.Do("SMEMBERS", workerPoolsKey))
 	if err != nil {
@@ -56,7 +57,7 @@ func (c *Client) WorkerPoolHeartbeats() ([]*WorkerPoolHeartbeat, error) {
 	sort.Strings(workerPoolIDs)
 
 	for _, wpid := range workerPoolIDs {
-		key := redisKeyHeartbeat(c.namespace, wpid)
+		key := redisKeyHeartbeat(c.namespace[0], wpid)
 		conn.Send("HGETALL", key)
 	}
 
@@ -116,6 +117,20 @@ func (c *Client) WorkerPoolHeartbeats() ([]*WorkerPoolHeartbeat, error) {
 	return heartbeats, nil
 }
 
+// WorkerPoolHeartbeats queries Redis and returns all WorkerPoolHeartbeat's it finds (even for those worker pools which don't have a current heartbeat).
+func (c *Client) WorkerPoolHeartbeats() ([]*WorkerPoolHeartbeat, error) {
+
+	heartbeats := []*WorkerPoolHeartbeat{}
+	for _, namespace := range c.namespace {
+		newHeartbeats, err := getHeartbeatsByNamespace(namespace, c)
+		if err != nil {
+			log.Printf(`Something weird happened: %+v`)
+		}
+		heartbeats = append(heartbeats, newHeartbeats...)
+	}
+	return heartbeats, nil
+}
+
 // WorkerObservation represents the latest observation taken from a worker. The observation indicates whether the worker is busy processing a job, and if so, information about that job.
 type WorkerObservation struct {
 	WorkerID string `json:"worker_id"`
@@ -130,8 +145,7 @@ type WorkerObservation struct {
 	CheckinAt int64  `json:"checkin_at"`
 }
 
-// WorkerObservations returns all of the WorkerObservation's it finds for all worker pools' workers.
-func (c *Client) WorkerObservations() ([]*WorkerObservation, error) {
+func getWorkerObservationsByNamespace(namespace string, c *Client) ([]*WorkerObservation, error) {
 	conn := c.pool.Get()
 	defer conn.Close()
 
@@ -147,7 +161,7 @@ func (c *Client) WorkerObservations() ([]*WorkerObservation, error) {
 	}
 
 	for _, wid := range workerIDs {
-		key := redisKeyWorkerObservation(c.namespace, wid)
+		key := redisKeyWorkerObservation(namespace, wid)
 		conn.Send("HGETALL", key)
 	}
 
@@ -201,6 +215,19 @@ func (c *Client) WorkerObservations() ([]*WorkerObservation, error) {
 	return observations, nil
 }
 
+// WorkerObservations returns all of the WorkerObservation's it finds for all worker pools' workers.
+func (c *Client) WorkerObservations() ([]*WorkerObservation, error) {
+	observations := []*WorkerObservation{}
+	for _, namespace := range c.namespace {
+		newObservations, err := getWorkerObservationsByNamespace(namespace, c)
+		if err != nil {
+			log.Printf(`Something weird happened: %+v`)
+		}
+		observations = append(observations, newObservations...)
+	}
+	return observations, nil
+}
+
 // Queue represents a queue that holds jobs with the same name. It indicates their name, count, and latency (in seconds). Latency is a measurement of how long ago the next job to be processed was enqueued.
 type Queue struct {
 	JobName string `json:"job_name"`
@@ -208,12 +235,11 @@ type Queue struct {
 	Latency int64  `json:"latency"`
 }
 
-// Queues returns the Queue's it finds.
-func (c *Client) Queues() ([]*Queue, error) {
+func getQueuesByNamespace(namespace string, c *Client) ([]*Queue, error) {
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	key := redisKeyKnownJobs(c.namespace)
+	key := redisKeyKnownJobs(namespace)
 	jobNames, err := redis.Strings(conn.Do("SMEMBERS", key))
 	if err != nil {
 		return nil, err
@@ -221,7 +247,7 @@ func (c *Client) Queues() ([]*Queue, error) {
 	sort.Strings(jobNames)
 
 	for _, jobName := range jobNames {
-		conn.Send("LLEN", redisKeyJobs(c.namespace, jobName))
+		conn.Send("LLEN", redisKeyJobs(namespace, jobName))
 	}
 
 	if err := conn.Flush(); err != nil {
@@ -248,7 +274,7 @@ func (c *Client) Queues() ([]*Queue, error) {
 
 	for _, s := range queues {
 		if s.Count > 0 {
-			conn.Send("LINDEX", redisKeyJobs(c.namespace, s.JobName), -1)
+			conn.Send("LINDEX", redisKeyJobs(c.namespace[0], s.JobName), -1)
 		}
 	}
 
@@ -274,7 +300,19 @@ func (c *Client) Queues() ([]*Queue, error) {
 			s.Latency = now - job.EnqueuedAt
 		}
 	}
+	return queues, nil
+}
 
+// Queues returns the Queue's it finds.
+func (c *Client) Queues() ([]*Queue, error) {
+	queues := []*Queue{}
+	for _, namespace := range c.namespace {
+		newQueues, err := getQueuesByNamespace(namespace, c)
+		if err != nil {
+			log.Printf(`Something weird happened: %+v`)
+		}
+		queues = append(queues, newQueues...)
+	}
 	return queues, nil
 }
 
@@ -296,9 +334,9 @@ type DeadJob struct {
 	*Job
 }
 
-// ScheduledJobs returns a list of ScheduledJob's. The page param is 1-based; each page is 20 items. The total number of items (not pages) in the list of scheduled jobs is also returned.
-func (c *Client) ScheduledJobs(page uint) ([]*ScheduledJob, int64, error) {
-	key := redisKeyScheduled(c.namespace)
+func getScheduledJobsByNamespace(namespace string, c *Client, page uint) ([]*ScheduledJob, int64, error) {
+
+	key := redisKeyScheduled(namespace)
 	jobsWithScores, count, err := c.getZsetPage(key, page)
 	if err != nil {
 		logError("client.scheduled_jobs.get_zset_page", err)
@@ -312,11 +350,26 @@ func (c *Client) ScheduledJobs(page uint) ([]*ScheduledJob, int64, error) {
 	}
 
 	return jobs, count, nil
+
 }
 
-// RetryJobs returns a list of RetryJob's. The page param is 1-based; each page is 20 items. The total number of items (not pages) in the list of retry jobs is also returned.
-func (c *Client) RetryJobs(page uint) ([]*RetryJob, int64, error) {
-	key := redisKeyRetry(c.namespace)
+// ScheduledJobs returns a list of ScheduledJob's. The page param is 1-based; each page is 20 items. The total number of items (not pages) in the list of scheduled jobs is also returned.
+func (c *Client) ScheduledJobs(page uint) ([]*ScheduledJob, int64, error) {
+	jobs := []*ScheduledJob{}
+	totalCount := int64(0)
+	for _, namespace := range c.namespace {
+		newJobs, count, err := getScheduledJobsByNamespace(namespace, c, page)
+		if err != nil {
+			log.Printf(`Something weird happened: %+v`)
+		}
+		jobs = append(jobs, newJobs...)
+		totalCount += count
+	}
+	return jobs, totalCount, nil
+}
+
+func getRetryJobsByNamespace(namespace string, c *Client, page uint) ([]*RetryJob, int64, error) {
+	key := redisKeyRetry(namespace)
 	jobsWithScores, count, err := c.getZsetPage(key, page)
 	if err != nil {
 		logError("client.retry_jobs.get_zset_page", err)
@@ -332,9 +385,23 @@ func (c *Client) RetryJobs(page uint) ([]*RetryJob, int64, error) {
 	return jobs, count, nil
 }
 
-// DeadJobs returns a list of DeadJob's. The page param is 1-based; each page is 20 items. The total number of items (not pages) in the list of dead jobs is also returned.
-func (c *Client) DeadJobs(page uint) ([]*DeadJob, int64, error) {
-	key := redisKeyDead(c.namespace)
+// RetryJobs returns a list of RetryJob's. The page param is 1-based; each page is 20 items. The total number of items (not pages) in the list of retry jobs is also returned.
+func (c *Client) RetryJobs(page uint) ([]*RetryJob, int64, error) {
+	jobs := []*RetryJob{}
+	totalCount := int64(0)
+	for _, namespace := range c.namespace {
+		newJobs, count, err := getRetryJobsByNamespace(namespace, c, page)
+		if err != nil {
+			log.Printf(`Something weird happened: %+v`)
+		}
+		jobs = append(jobs, newJobs...)
+		totalCount += count
+	}
+	return jobs, totalCount, nil
+}
+
+func getDeadJobsByNamespace(namespace string, c *Client, page uint) ([]*DeadJob, int64, error) {
+	key := redisKeyDead(namespace)
 	jobsWithScores, count, err := c.getZsetPage(key, page)
 	if err != nil {
 		logError("client.dead_jobs.get_zset_page", err)
@@ -350,9 +417,24 @@ func (c *Client) DeadJobs(page uint) ([]*DeadJob, int64, error) {
 	return jobs, count, nil
 }
 
+// DeadJobs returns a list of DeadJob's. The page param is 1-based; each page is 20 items. The total number of items (not pages) in the list of dead jobs is also returned.
+func (c *Client) DeadJobs(page uint) ([]*DeadJob, int64, error) {
+	jobs := []*DeadJob{}
+	totalCount := int64(0)
+	for _, namespace := range c.namespace {
+		newJobs, count, err := getDeadJobsByNamespace(namespace, c, page)
+		if err != nil {
+			log.Printf(`Something weird happened: %+v`)
+		}
+		jobs = append(jobs, newJobs...)
+		totalCount += count
+	}
+	return jobs, totalCount, nil
+}
+
 // DeleteDeadJob deletes a dead job from Redis.
 func (c *Client) DeleteDeadJob(diedAt int64, jobID string) error {
-	ok, _, err := c.deleteZsetJob(redisKeyDead(c.namespace), diedAt, jobID)
+	ok, _, err := c.deleteZsetJob(redisKeyDead(c.namespace[0]), diedAt, jobID)
 	if err != nil {
 		return err
 	}
@@ -380,11 +462,11 @@ func (c *Client) RetryDeadJob(diedAt int64, jobID string) error {
 	script := redis.NewScript(len(jobNames)+1, redisLuaRequeueSingleDeadCmd)
 
 	args := make([]interface{}, 0, len(jobNames)+1+3)
-	args = append(args, redisKeyDead(c.namespace)) // KEY[1]
+	args = append(args, redisKeyDead(c.namespace[0])) // KEY[1]
 	for _, jobName := range jobNames {
-		args = append(args, redisKeyJobs(c.namespace, jobName)) // KEY[2, 3, ...]
+		args = append(args, redisKeyJobs(c.namespace[0], jobName)) // KEY[2, 3, ...]
 	}
-	args = append(args, redisKeyJobsPrefix(c.namespace)) // ARGV[1]
+	args = append(args, redisKeyJobsPrefix(c.namespace[0])) // ARGV[1]
 	args = append(args, nowEpochSeconds())
 	args = append(args, diedAt)
 	args = append(args, jobID)
@@ -423,11 +505,11 @@ func (c *Client) RetryAllDeadJobs() error {
 	script := redis.NewScript(len(jobNames)+1, redisLuaRequeueAllDeadCmd)
 
 	args := make([]interface{}, 0, len(jobNames)+1+3)
-	args = append(args, redisKeyDead(c.namespace)) // KEY[1]
+	args = append(args, redisKeyDead(c.namespace[0])) // KEY[1]
 	for _, jobName := range jobNames {
-		args = append(args, redisKeyJobs(c.namespace, jobName)) // KEY[2, 3, ...]
+		args = append(args, redisKeyJobs(c.namespace[0], jobName)) // KEY[2, 3, ...]
 	}
-	args = append(args, redisKeyJobsPrefix(c.namespace)) // ARGV[1]
+	args = append(args, redisKeyJobsPrefix(c.namespace[0])) // ARGV[1]
 	args = append(args, nowEpochSeconds())
 	args = append(args, 1000)
 
@@ -455,7 +537,7 @@ func (c *Client) RetryAllDeadJobs() error {
 func (c *Client) DeleteAllDeadJobs() error {
 	conn := c.pool.Get()
 	defer conn.Close()
-	_, err := conn.Do("DEL", redisKeyDead(c.namespace))
+	_, err := conn.Do("DEL", redisKeyDead(c.namespace[0]))
 	if err != nil {
 		logError("client.delete_all_dead_jobs", err)
 		return err
@@ -466,7 +548,7 @@ func (c *Client) DeleteAllDeadJobs() error {
 
 // DeleteScheduledJob deletes a job in the scheduled queue.
 func (c *Client) DeleteScheduledJob(scheduledFor int64, jobID string) error {
-	ok, jobBytes, err := c.deleteZsetJob(redisKeyScheduled(c.namespace), scheduledFor, jobID)
+	ok, jobBytes, err := c.deleteZsetJob(redisKeyScheduled(c.namespace[0]), scheduledFor, jobID)
 	if err != nil {
 		return err
 	}
@@ -480,7 +562,7 @@ func (c *Client) DeleteScheduledJob(scheduledFor int64, jobID string) error {
 		}
 
 		if job.Unique {
-			uniqueKey, err := redisKeyUniqueJob(c.namespace, job.Name, job.Args)
+			uniqueKey, err := redisKeyUniqueJob(c.namespace[0], job.Name, job.Args)
 			if err != nil {
 				logError("client.delete_scheduled_job.redis_key_unique_job", err)
 				return err
@@ -504,7 +586,7 @@ func (c *Client) DeleteScheduledJob(scheduledFor int64, jobID string) error {
 
 // DeleteRetryJob deletes a job in the retry queue.
 func (c *Client) DeleteRetryJob(retryAt int64, jobID string) error {
-	ok, _, err := c.deleteZsetJob(redisKeyRetry(c.namespace), retryAt, jobID)
+	ok, _, err := c.deleteZsetJob(redisKeyRetry(c.namespace[0]), retryAt, jobID)
 	if err != nil {
 		return err
 	}

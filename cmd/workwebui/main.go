@@ -9,7 +9,8 @@ import (
 	"time"
 
 	"github.com/garyburd/redigo/redis"
-	"github.com/gocraft/work/webui"
+	"github.com/alexandruleca/work/webui"
+	"strings"
 )
 
 var (
@@ -19,13 +20,24 @@ var (
 	webHostPort    = flag.String("listen", ":5040", "hostport to listen for HTTP JSON API")
 )
 
+func resolveNamespaceInput() (result []string) {
+	splitString := strings.Split(*redisNamespace, ",")
+	for _, s := range splitString {
+		result = append(result, strings.TrimSpace(s))
+	}
+	return
+}
+
 func main() {
 	flag.Parse()
+
+	namespaces := resolveNamespaceInput()
 
 	fmt.Println("Starting workwebui:")
 	fmt.Println("redis = ", *redisHostPort)
 	fmt.Println("database = ", *redisDatabase)
-	fmt.Println("namespace = ", *redisNamespace)
+	fmt.Printf("namespace = %+v", namespaces)
+	fmt.Println("")
 	fmt.Println("listen = ", *webHostPort)
 
 	database, err := strconv.Atoi(*redisDatabase)
@@ -36,7 +48,7 @@ func main() {
 
 	pool := newPool(*redisHostPort, database)
 
-	server := webui.NewServer(*redisNamespace, pool, *webHostPort)
+	server := webui.NewServer(namespaces, pool, *webHostPort)
 	server.Start()
 
 	c := make(chan os.Signal, 1)
